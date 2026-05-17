@@ -101,17 +101,20 @@ func volatilityRegime(volatilityPct float64) string {
 	}
 }
 
-func spreadRegime(spreadPct float64) string {
-	switch {
-	case spreadPct >= SPREAD_EXTREME_PCT:
-		return "extreme"
-	case spreadPct >= SPREAD_HIGH_PCT:
-		return "high"
-	case spreadPct >= SPREAD_LOW_PCT:
-		return "normal"
-	default:
-		return "low"
+func midPrice(pricePair [2]exchange.Price) float64 {
+	bid := pricePair[0].Price
+	ask := pricePair[1].Price
+	if bid <= 0 || ask <= 0 || ask < bid {
+		return 0
 	}
+	return (bid + ask) / 2
+}
+
+func pricePairTime(pricePair [2]exchange.Price) time.Time {
+	if !pricePair[0].Time.IsZero() {
+		return pricePair[0].Time
+	}
+	return pricePair[1].Time
 }
 
 // smaSlopeRegime classifies 1m SMA slope (% change vs prior bar). Values: flat, up_normal, up_strong, down_normal, down_strong.
@@ -141,22 +144,6 @@ func nearVolumeRegime(strength float64) string {
 	default:
 		return "low"
 	}
-}
-
-func midPrice(pricePair [2]exchange.Price) float64 {
-	bid := pricePair[0].Price
-	ask := pricePair[1].Price
-	if bid <= 0 || ask <= 0 || ask < bid {
-		return 0
-	}
-	return (bid + ask) / 2
-}
-
-func pricePairTime(pricePair [2]exchange.Price) time.Time {
-	if !pricePair[0].Time.IsZero() {
-		return pricePair[0].Time
-	}
-	return pricePair[1].Time
 }
 
 func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
@@ -608,4 +595,17 @@ func EMA(newValue, oldValue, alpha float64) float64 {
 		return newValue
 	}
 	return alpha*newValue + (1-alpha)*oldValue
+}
+
+func spreadRegime(spreadPct float64) string {
+	switch {
+	case spreadPct >= SPREAD_EXTREME_PCT:
+		return "extreme"
+	case spreadPct >= SPREAD_HIGH_PCT:
+		return "high"
+	case spreadPct >= SPREAD_LOW_PCT:
+		return "normal"
+	default:
+		return "low"
+	}
 }

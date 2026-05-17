@@ -12,10 +12,10 @@ import (
 
 // Config holds all configuration parameters
 type Config struct {
-	DynamicConfig bool               `json:"enable_dynamic_config,omitempty"` // If config file gets updated, reload the config.
-	Exchanges     []ExchangeConfig   `json:"exchanges"`                       // Required
-	Model         ModelConfig        `json:"model,omitempty"`
-	Dashboard     DashboardConfig    `json:"dashboard,omitempty"`           // Dashboard HTML / UX (optional)
+	DynamicConfig bool             `json:"enable_dynamic_config,omitempty"` // If config file gets updated, reload the config.
+	Exchanges     []ExchangeConfig `json:"exchanges"`                       // Required
+	Model         ModelConfig      `json:"model,omitempty"`
+	Dashboard     DashboardConfig  `json:"dashboard,omitempty"` // Dashboard HTML / UX (optional)
 }
 
 // ExchangeConfig holds exchange-specific configuration
@@ -39,7 +39,8 @@ type DashboardConfig struct {
 
 // ModelConfig configures the market model (optional).
 type ModelConfig struct {
-	Pairs []string `json:"pairs,omitempty"`
+	Pairs      []string                  `json:"pairs,omitempty"`
+	Trailguard *TrailguardStrategyConfig `json:"trailguard,omitempty"`
 }
 
 // LoadConfig loads configuration from a file
@@ -113,5 +114,10 @@ func (sc *ModelConfig) Print() {
 	log.Printf("MODEL CONFIGURATION:")
 	log.Println("Trader Settings:")
 	log.Printf("  Pairs                : %v", sc.Pairs)
+	if sc.Trailguard != nil && sc.Trailguard.Enabled {
+		log.Printf("  Trailguard           : enabled mode=%s", sc.Trailguard.Mode)
+	} else {
+		log.Printf("  Trailguard           : (disabled)")
+	}
 	log.Println()
 }

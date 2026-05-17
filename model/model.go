@@ -95,6 +95,8 @@ type trader struct {
 	m1_SMA200         float64
 	m1_SMA200Slope    float64
 	m1_SMA200Distance float64
+	// Trailguard is Pure Guard session state (dynamic stop); optional book-mode resting stop id.
+	Trailguard TrailguardData
 	sync.RWMutex
 }
 
@@ -340,14 +342,64 @@ func (strat *Marketmaker) Stop() {
 }
 
 func (strat *Marketmaker) update() {
+	// HTF MM: add entry / quoting logic here; manageOrders handles trailing for open positions only.
+	strat.manageOrders()
+}
 
+// manageOrders runs the trailing engine for every pair that currently has size, and clears book stops
+// for flat pairs that still have trailing bookkeeping.
+func (strat *Marketmaker) manageOrders() {
+	if strat.config == nil || strat.config.Trailguard == nil || !strat.config.Trailguard.Enabled {
+		return
+	}
+	openPairs := make(map[string]struct{})
+	for pair, pos := range strat.Exchange.GetPositions() {
+		if pos.Size == 0 {
+			continue
+		}
+		openPairs[pair] = struct{}{}
+		if t := strat.traders[pair]; t != nil {
+			t.manageOrders()
+		}
+	}
+	for _, t := range strat.traders {
+		if t == nil {
+			continue
+		}
+		if _, ok := openPairs[t.Pair]; ok {
+			continue
+		}
+		t.manageOrders()
+	}
 }
 
 func (strat *Marketmaker) closeInstantProfitPosition(pos *exchange.Position) {
-	if pos == nil || pos.Size == 0 || pos.PNL <= 0 {
+	if pos == nil || pos.Size == 0 {
 		return
 	}
 	if strat.traders[pos.Pair] == nil {
+		return
+	}
+
+	t := strat.traders[pos.Pair]
+	t.RLock()
+	bid, ask := t.bestBid, t.bestAsk
+	t.RUnlock()
+
+	entry := pos.AvgPrice
+	if entry <= 0 || bid <= 0 || ask <= 0 || ask < bid {
+		return
+	}
+
+	// Profitable at market touch: long exit is a sell vs bid; short exit is a buy vs ask.
+	var ok bool
+	switch {
+	case pos.Size > 0:
+		ok = bid > entry
+	default:
+		ok = ask < entry
+	}
+	if !ok {
 		return
 	}
 
@@ -369,10 +421,10 @@ func (strat *Marketmaker) closeInstantProfitPosition(pos *exchange.Position) {
 	}
 
 	if err := strat.Exchange.PlaceOrders([]exchange.Order{order}); err != nil {
-		log.Printf("instant close: failed closing profitable %s position %.6f PnL $%+.2f: %v", pos.Pair, pos.Size, pos.PNL, err)
+		log.Printf("instant close: failed closing %s position %.6f bid=%.6f ask=%.6f entry=%.6f: %v", pos.Pair, pos.Size, bid, ask, entry, err)
 		return
 	}
-	log.Printf("instant close: %s %s %.6f profitable position PnL $%+.2f", pos.Pair, side, order.Size, pos.PNL)
+	log.Printf("instant close: %s %s %.6f bid=%.6f ask=%.6f entry=%.6f PnL $%+.2f", pos.Pair, side, order.Size, bid, ask, entry, pos.PNL)
 }
 
 func (strat *Marketmaker) hasReduceOnlyCloseOrder(pair string, positionSize float64) bool {
