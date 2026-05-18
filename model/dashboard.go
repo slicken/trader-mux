@@ -46,11 +46,13 @@ type DashboardData struct {
 }
 
 type dashboardTemplateData struct {
-	ChartWindowSeconds int
-	RefreshMs          int
-	ChartScaleRatio    float64
-	NearDepthPct       float64
-	OrderbookDepthPct  float64
+	ChartWindowSeconds   int
+	RefreshMs            int
+	ChartScaleRatio      float64
+	NearDepthPct         float64
+	OrderbookDepthPct    float64
+	TradesDeltaWindowSec int
+	VolatilityWindowSec  int
 }
 
 type DashboardPairData struct {
@@ -66,7 +68,8 @@ type DashboardPairData struct {
 	VPOC                 float64               `json:"vpoc"`
 	VpocRatio            float64               `json:"vpoc_ratio"`
 	VpocRegime           string                `json:"vpoc_regime"`
-	VolumePct            float64               `json:"volume_pct"`
+	VolumeImbalancePct   float64               `json:"volume_imbalance_pct"`
+	VolumeVelocity       float64               `json:"volume_velocity"` // EMA of top-of-book OFI (quote notional, e.g. USD)
 	NearBidsVolumeStr    float64               `json:"near_bids_volume_str"`
 	NearBidsVolumeAvg    float64               `json:"near_bids_volume_avg"`
 	NearBidsVolumeRegime string                `json:"near_bids_volume_regime"`
@@ -76,6 +79,10 @@ type DashboardPairData struct {
 	VolatilityPct        float64               `json:"volatility_pct"`
 	VolatilityRegime     string                `json:"volatility_regime"`
 	TradesPerMinute      int                   `json:"trades_per_minute"`
+	TradesFlowSec          float64               `json:"trades_flow_sec"`         // signed taker notional / s (avg over TRADES_DELTA_WINDOW)
+	TradesImbalancePct   float64               `json:"trades_imbalance_pct"`  // taker buy vs sell notional imbalance % in window
+	TradesDelta          float64               `json:"trades_delta"`          // net buy fills minus sell fills in window (count)
+	TradesDeltaVolume    float64               `json:"trades_delta_volume"`   // signed quote notional (buy - sell) in window
 	OpenInterest         int64                 `json:"open_interest"`
 	FundingRate          float64               `json:"funding_rate"`
 	M1_SMA20             float64               `json:"m1_sma20"`
@@ -411,6 +418,8 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		const CHART_SCALE_RATIO = {{ .ChartScaleRatio }};
 		const ORDERBOOK_NEAR_DEPTH_PCT = {{ .NearDepthPct }};
 		const ORDERBOOK_DEPTH_PCT = {{ .OrderbookDepthPct }};
+		const TRADES_DELTA_WINDOW_SEC = {{ .TradesDeltaWindowSec }};
+		const VOLATILITY_WINDOW_SEC = {{ .VolatilityWindowSec }};
 		let chartWindowSeconds = DASHBOARD_CHART_WINDOW_SECONDS;
 		let charts = {};
 		let renderedKeys = [];
@@ -726,6 +735,30 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			'</div>';
 		}
 
+		function volumeImbalanceBox(imbPct, velPct) {
+			return '<div class="metric">' +
+				'<div class="metric-label">Volume Imbalance</div>' +
+				'<div class="metric-value ' + cls(imbPct) + '">' + pct(imbPct) + '</div>' +
+				'<div class="metric-value compact ' + cls(velPct) + ' near-volume-avg-line">velo $' + fmt(velPct, 2) + '</div>' +
+				'</div>';
+		}
+
+		function tradesCountWindowBox(delta, imbPct) {
+			return '<div class="metric">' +
+				'<div class="metric-label">Trades Delta ' + TRADES_DELTA_WINDOW_SEC + 's</div>' +
+				'<div class="metric-value ' + cls(delta) + '">' + fmt(delta, 0) + '</div>' +
+				'<div class="metric-value compact ' + cls(imbPct) + ' near-volume-avg-line">imb ' + pct(imbPct) + '</div>' +
+				'</div>';
+		}
+
+		function tradesFlowImbBox(flow, deltaVolume) {
+			return '<div class="metric">' +
+				'<div class="metric-label">Trades Flow ' + TRADES_DELTA_WINDOW_SEC + 's</div>' +
+				'<div class="metric-value ' + cls(flow) + '">' + fmt(flow, 2) + '/s</div>' +
+				'<div class="metric-value compact ' + cls(deltaVolume) + ' near-volume-avg-line">vol $' + fmt(deltaVolume, 2) + '</div>' +
+				'</div>';
+		}
+
 		function metricsHtml(row) {
 			const digits = priceDigits(row);
 			const orderbookDigits = Math.max(0, digits - 1);
@@ -736,12 +769,14 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 				compactMetric('OB Depth ' + ORDERBOOK_DEPTH_PCT + '%', fmtPrice(row.ob_min_price, orderbookDigits) + ' / ' + fmtPrice(row.ob_max_price, orderbookDigits)) +
 				vpocBox(row.vpoc, row.vpoc_ratio, row.vpoc_regime, digits) +
 				metric('Trades / min', row.trades_per_minute) +
-				metric('Volume Imbalance', pct(row.volume_pct), cls(row.volume_pct)) +
+				tradesCountWindowBox(row.trades_delta, row.trades_imbalance_pct) +
+				tradesFlowImbBox(row.trades_flow_sec, row.trades_delta_volume) +
+				volumeImbalanceBox(row.volume_imbalance_pct, row.volume_velocity) +
 				nearVolumeBox('Near Bids Vol', row.near_bids_volume_str, row.near_bids_volume_avg, row.near_bids_volume_regime) +
 				nearVolumeBox('Near Asks Vol', row.near_asks_volume_str, row.near_asks_volume_avg, row.near_asks_volume_regime) +
 				spreadBox('Spread', row.spread, row.spread_avg, row.spread_regime) +
 				metric('Slippage Avg', pct(row.slippage_avg), 'neutral') +
-				regimeMetric('Volatility 10s', pct(row.volatility_pct), row.volatility_regime) +
+				regimeMetric('Volatility ' + VOLATILITY_WINDOW_SEC + 's', pct(row.volatility_pct), row.volatility_regime) +
 				metric('Open Interest', row.open_interest) +
 				metric('Funding', pct(row.funding_rate, 6), cls(row.funding_rate)) +
 				smaBox('SMA20', row.m1_sma20, row.m1_sma20_slope, row.m1_sma20_slope_regime, row.m1_sma20_distance, digits) +
@@ -1123,11 +1158,13 @@ func (d *Dashboard) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	winSec, refMs, scale := d.effectiveDashboardPrefs()
 	data := dashboardTemplateData{
-		ChartWindowSeconds: winSec,
-		RefreshMs:          refMs,
-		ChartScaleRatio:    scale,
-		NearDepthPct:       ORDERBOOK_NEAR_DEPTH_PCT,
-		OrderbookDepthPct:  ORDERBOOK_DEPTH_PCT,
+		ChartWindowSeconds:   winSec,
+		RefreshMs:            refMs,
+		ChartScaleRatio:      scale,
+		NearDepthPct:         ORDERBOOK_NEAR_DEPTH_PCT,
+		OrderbookDepthPct:    ORDERBOOK_DEPTH_PCT,
+		TradesDeltaWindowSec: int(TRADES_DELTA_WINDOW / time.Second),
+		VolatilityWindowSec:  int(VOLATILITY_WINDOW / time.Second),
 	}
 	if err := template.Must(template.New("dashboard").Parse(tmpl)).Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1201,7 +1238,8 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			VPOC:                 t.vpoc,
 			VpocRatio:            t.vpocRatio,
 			VpocRegime:           vpocRegime(t.vpoc, t.vpocRatio),
-			VolumePct:            t.volumePct,
+			VolumeImbalancePct:   t.volumeImbalancePct,
+			VolumeVelocity:       t.volumeVelocity,
 			NearBidsVolumeStr:    t.nearBidsVolumeStr,
 			NearBidsVolumeAvg:    t.nearBidsVolumeAvg,
 			NearBidsVolumeRegime: nearVolumeRegime(t.nearBidsVolumeStr),
@@ -1210,7 +1248,11 @@ func (d *Dashboard) getDashboardData() DashboardData {
 			NearAsksVolumeRegime: nearVolumeRegime(t.nearAsksVolumeStr),
 			VolatilityPct:        t.volatilityPct,
 			VolatilityRegime:     volatilityRegime(t.volatilityPct),
-			TradesPerMinute:      t.tradePerMinute,
+			TradesPerMinute:      t.tradesPerMinute,
+			TradesFlowSec:          t.tradesFlowSec,
+			TradesImbalancePct:   t.tradesImbalancePct,
+			TradesDelta:          t.tradesDelta,
+			TradesDeltaVolume:    t.tradesDeltaVolume,
 			OpenInterest:         int64(t.openInterest),
 			FundingRate:          t.fundingRate,
 			M1_SMA20:             t.m1_SMA20,

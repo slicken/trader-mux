@@ -49,6 +49,15 @@ func (t *trader) updatePrices(prices *[]exchange.Price) {
 	t.updateM1SMADistances()
 }
 
+func midPrice(pricePair [2]exchange.Price) float64 {
+	bid := pricePair[0].Price
+	ask := pricePair[1].Price
+	if bid <= 0 || ask <= 0 || ask < bid {
+		return 0
+	}
+	return (bid + ask) / 2
+}
+
 func calculateLatencyBufferPct(latencyMs int64, spreadPct float64) float64 {
 	latencySeconds := float64(latencyMs) / 2 / 1000
 	fixedBuffer := math.Max(latencySeconds*0.1, LATENCY_MIN_BUFFER_PCT)
@@ -61,7 +70,7 @@ func calculateVolatilityPct(prices [][2]exchange.Price, window time.Duration) fl
 		return 0
 	}
 
-	latestTime := pricePairTime(prices[0])
+	latestTime := prices[0][0].Time
 	if latestTime.IsZero() {
 		return 0
 	}
@@ -70,7 +79,7 @@ func calculateVolatilityPct(prices [][2]exchange.Price, window time.Duration) fl
 	var sumSq float64
 	// We loop back from the newest price (index 0) to the cutoff
 	for i := 1; i < len(prices); i++ {
-		if pricePairTime(prices[i-1]).Before(cutoff) {
+		if prices[i-1][0].Time.Before(cutoff) {
 			break
 		}
 
@@ -101,56 +110,47 @@ func volatilityRegime(volatilityPct float64) string {
 	}
 }
 
-func midPrice(pricePair [2]exchange.Price) float64 {
-	bid := pricePair[0].Price
-	ask := pricePair[1].Price
-	if bid <= 0 || ask <= 0 || ask < bid {
-		return 0
-	}
-	return (bid + ask) / 2
-}
-
-func pricePairTime(pricePair [2]exchange.Price) time.Time {
-	if !pricePair[0].Time.IsZero() {
-		return pricePair[0].Time
-	}
-	return pricePair[1].Time
-}
-
-// smaSlopeRegime classifies 1m SMA slope (% change vs prior bar). Values: flat, up_normal, up_strong, down_normal, down_strong.
-func smaSlopeRegime(slopePct float64) string {
-	switch {
-	case math.Abs(slopePct) <= SMA_SLOPE_FLAT_PCT:
-		return "flat"
-	case slopePct > SMA_SLOPE_STRONG_PCT:
-		return "up_strong"
-	case slopePct > SMA_SLOPE_FLAT_PCT:
-		return "up_normal"
-	case slopePct < -SMA_SLOPE_STRONG_PCT:
-		return "down_strong"
-	default:
-		return "down_normal"
-	}
-}
-
-func nearVolumeRegime(strength float64) string {
-	switch {
-	case strength >= ORDERBOOK_NEAR_EXTREME_PCT:
-		return "extreme"
-	case strength >= ORDERBOOK_NEAR_HIGH_PCT:
-		return "high"
-	case strength >= ORDERBOOK_NEAR_NORMAL_PCT:
-		return "normal"
-	default:
-		return "low"
-	}
-}
-
 func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
-	bidsVol, asksVol, volumePct, bidNearNotional, askNearNotional, vpoc, vpRat := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
+
+	var curBidP, curBidSz, curAskP, curAskSz float64
+	topOK := orderbook != nil && len(orderbook.Bids) > 0 && len(orderbook.Asks) > 0
+	if topOK {
+		curBidP = orderbook.Bids[0].Price
+		curBidSz = orderbook.Bids[0].Size
+		curAskP = orderbook.Asks[0].Price
+		curAskSz = orderbook.Asks[0].Size
+	}
 
 	t.Lock()
 	defer t.Unlock()
+
+	bidsVol, asksVol, volumeImbalancePct, bidNearNotional, askNearNotional, vpoc, vpRat := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
+	now := time.Now()
+
+	prev := &t.volumeVelocityProfile
+	newVel := t.volumeVelocity
+	if topOK && prev.valid {
+		if now.Sub(prev.at) >= time.Duration(ORDERBOOK_VELOCITY_MIN_GAP_MS)*time.Millisecond {
+			tickSize := 0.0
+			if t.parent != nil && t.parent.Exchange != nil {
+				if pair, err := t.parent.Exchange.Pair(t.Pair); err == nil {
+					tickSize = pair.Base.TickSize
+				}
+			}
+			raw := topOfBookOFI(curBidP, curBidSz, curAskP, curAskSz, prev.bidPrice, prev.bidSize, prev.askPrice, prev.askSize, tickSize)
+			newVel = EMA(raw, t.volumeVelocity, ORDERBOOK_VELOCITY_EMA_ALPHA)
+			prev.bidPrice, prev.bidSize = curBidP, curBidSz
+			prev.askPrice, prev.askSize = curAskP, curAskSz
+			prev.at = now
+		}
+	} else if topOK {
+		prev.bidPrice, prev.bidSize = curBidP, curBidSz
+		prev.askPrice, prev.askSize = curAskP, curAskSz
+		prev.at = now
+		prev.valid = true
+	} else {
+		prev.valid = false
+	}
 
 	t.nearBidsVolumeAvg = EMA(bidNearNotional, t.nearBidsVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
 	t.nearAsksVolumeAvg = EMA(askNearNotional, t.nearAsksVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
@@ -166,12 +166,13 @@ func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
 
 	t.bidsVol = bidsVol
 	t.asksVol = asksVol
-	t.volumePct = volumePct
+	t.volumeImbalancePct = volumeImbalancePct
 	t.vpoc = vpoc
 	t.vpocRatio = vpRat
+	t.volumeVelocity = newVel
 }
 
-func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol, asksVol, imb, bidNear, askNear, vpoc, vpRat float64) {
+func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol, asksVol, volumeImbalancePct, bidNear, askNear, vpoc, vpRat float64) {
 	if ob == nil || levels <= 0 || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
 		return
 	}
@@ -181,16 +182,17 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol
 		return
 	}
 
-	tickSize := 0.0
-	if t.parent != nil && t.parent.Exchange != nil {
-		if pair, err := t.parent.Exchange.Pair(t.Pair); err == nil {
-			tickSize = pair.Base.TickSize
+	// Tick size is only needed to derive BucketSize once; avoid Exchange.Pair on every snapshot.
+	if t.vpocProfile.BucketSize <= 0 {
+		tickSize := 0.0
+		if t.parent != nil && t.parent.Exchange != nil {
+			if pair, err := t.parent.Exchange.Pair(t.Pair); err == nil {
+				tickSize = pair.Base.TickSize
+			}
 		}
-	}
-
-	// decayed profile; zero or lower uses only the current orderbook snapshot.
-	if t.vpocProfile.BucketSize <= 0 && tickSize > 0 {
-		t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
+		if tickSize > 0 {
+			t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
+		}
 	}
 	t.vpocProfile.DecayFactor = ORDERBOOK_VPOC_DECAY_FACTOR
 
@@ -272,13 +274,13 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol
 	process(ob.Asks, false)
 
 	totalWeightedNotional := weightedBidNotional + weightedAskNotional
-	imbalance := 0.0
+	volumeImbalancePct = 0.0
 	if totalWeightedNotional > 0 {
-		imbalance = ((weightedBidNotional - weightedAskNotional) / totalWeightedNotional) * 100.0
+		volumeImbalancePct = ((weightedBidNotional - weightedAskNotional) / totalWeightedNotional) * 100.0
 	}
 
 	if !vpocEnabled {
-		return actualBidNotional, actualAskNotional, imbalance, bidNearNotional, askNearNotional, 0, 0
+		return actualBidNotional, actualAskNotional, volumeImbalancePct, bidNearNotional, askNearNotional, 0, 0
 	}
 
 	// VPOC is the highest-volume price level inside the single highest-volume bucket.
@@ -295,7 +297,7 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol
 	}
 
 	if maxBucketVolume <= 0 {
-		return actualBidNotional, actualAskNotional, imbalance, bidNearNotional, askNearNotional, 0, 0
+		return actualBidNotional, actualAskNotional, volumeImbalancePct, bidNearNotional, askNearNotional, 0, 0
 	}
 
 	price := vpocBucketPrice[bestIdx].Price
@@ -304,7 +306,47 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol
 	}
 
 	vpRat = vpocBucketRatio(vpocBuckets, bestIdx)
-	return actualBidNotional, actualAskNotional, imbalance, bidNearNotional, askNearNotional, price, vpRat
+	return actualBidNotional, actualAskNotional, volumeImbalancePct, bidNearNotional, askNearNotional, price, vpRat
+}
+
+// topOfBookOFI is the Cont–Kukanov–Stoikov style increment from prev to cur best bid/ask, in quote notional (price×size, USD for USD-quoted perps).
+// tickSize > 0 uses half-tick for "same price" vs improved bid / lowered ask.
+func topOfBookOFI(curBidP, curBidSz, curAskP, curAskSz, prevBidP, prevBidSz, prevAskP, prevAskSz, tickSize float64) float64 {
+	deltaBid := curBidSz - prevBidSz
+	deltaAsk := curAskSz - prevAskSz
+	var ofi float64
+	eps := tickSize / 2
+	sameBid := tickSize > 0 && math.Abs(curBidP-prevBidP) <= eps
+	sameAsk := tickSize > 0 && math.Abs(curAskP-prevAskP) <= eps
+	if tickSize <= 0 {
+		sameBid = curBidP == prevBidP
+		sameAsk = curAskP == prevAskP
+	}
+	if tickSize > 0 && curBidP > prevBidP+eps {
+		ofi += curBidP * curBidSz
+	} else if sameBid {
+		ofi += curBidP * deltaBid
+	} else if tickSize <= 0 && curBidP > prevBidP {
+		ofi += curBidP * curBidSz
+	}
+	if tickSize > 0 && curAskP < prevAskP-eps {
+		ofi -= curAskP * curAskSz
+	} else if sameAsk {
+		ofi -= curAskP * deltaAsk
+	} else if tickSize <= 0 && curAskP < prevAskP {
+		ofi -= curAskP * curAskSz
+	}
+	return ofi
+}
+
+// VolumeVelocityProfile holds the last accepted top-of-book snapshot for volumeVelocity (OFI).
+type VolumeVelocityProfile struct {
+	bidPrice float64
+	askPrice float64
+	bidSize  float64
+	askSize  float64
+	at       time.Time
+	valid    bool
 }
 
 type VPOCProfile struct {
@@ -364,6 +406,19 @@ func vpocRegime(vpoc float64, vsNextTwoRatio float64) string {
 	}
 }
 
+func nearVolumeRegime(strength float64) string {
+	switch {
+	case strength >= ORDERBOOK_NEAR_EXTREME_PCT:
+		return "extreme"
+	case strength >= ORDERBOOK_NEAR_HIGH_PCT:
+		return "high"
+	case strength >= ORDERBOOK_NEAR_NORMAL_PCT:
+		return "normal"
+	default:
+		return "low"
+	}
+}
+
 func (t *trader) updateTrade(trade *exchange.Trade) {
 	if trade == nil {
 		return
@@ -373,25 +428,84 @@ func (t *trader) updateTrade(trade *exchange.Trade) {
 	defer t.Unlock()
 
 	insertWithLimitInPlace(&t.Trades, *trade, ARRAY_SIZE)
-	t.tradePerMinute = t.calculateTradesInDuration(time.Minute)
-	t.calculateSlippage(trade)
+
+	perMin := calculateTradesInDurationFromTrades(t.Trades, time.Minute)
+	now := time.Now()
+	td, tdVol, timb, tfSec := aggregatedTradesFlowMetrics(t.Trades, now)
+
+	bestBid, bestAsk := t.bestBid, t.bestAsk
+	if sample, ok := calculateTradeSlippagePct(trade, bestBid, bestAsk); ok {
+		newSlip := append([]float64(nil), t.slippagePct...)
+		insertWithLimitInPlace(&newSlip, sample, ARRAY_SIZE)
+		t.slippagePct = newSlip
+		t.slippageAvg = slippageAvgFromSlice(newSlip)
+	}
+
+	t.tradesPerMinute = perMin
+	t.tradesDelta = td
+	t.tradesDeltaVolume = tdVol
+	t.tradesImbalancePct = timb
+	t.tradesFlowSec = tfSec
 }
 
-// calculateTradesInDuration calculates the number of stored trades inside duration.
-// The caller must hold t.Lock or t.RLock.
-func (t *trader) calculateTradesInDuration(duration time.Duration) int {
-	if len(t.Trades) == 0 {
+// aggregatedTradesFlowMetrics returns net buy-minus-sell fill count (tradesDelta), signed quote-notional
+// buy-minus-sell (tradesDeltaVolume), taker notional imbalance %, and signed notional per second (tradesFlowSec) over TRADES_DELTA_WINDOW.
+// Read-only over trades.
+func aggregatedTradesFlowMetrics(trades []exchange.Trade, now time.Time) (tradesDelta, tradesDeltaVolume, tradesImbalancePct, tradesFlowSec float64) {
+	cutoff := now.Add(-TRADES_DELTA_WINDOW)
+	var buyN, sellN float64
+	var buyCnt, sellCnt int
+	for i := 0; i < len(trades); i++ {
+		tr := &trades[i]
+		for _, f := range tr.Fills {
+			if f == nil || f.Size <= 0 || f.Price <= 0 {
+				continue
+			}
+			if f.Time.Before(cutoff) {
+				continue
+			}
+			side := strings.ToLower(f.Side)
+			if side != "buy" && side != "sell" && tr.Order != nil {
+				side = strings.ToLower(tr.Order.Side)
+			}
+			n := f.Price * f.Size
+			switch side {
+			case "buy":
+				buyN += n
+				buyCnt++
+			case "sell":
+				sellN += n
+				sellCnt++
+			}
+		}
+	}
+	tradesDelta = float64(buyCnt - sellCnt)
+	tradesDeltaVolume = buyN - sellN
+	totalN := buyN + sellN
+	if totalN > 0 {
+		tradesImbalancePct = ((buyN - sellN) / totalN) * 100.0
+	}
+	sec := TRADES_DELTA_WINDOW.Seconds()
+	if sec > 0 {
+		tradesFlowSec = (buyN - sellN) / sec
+	}
+	return tradesDelta, tradesDeltaVolume, tradesImbalancePct, tradesFlowSec
+}
+
+// calculateTradesInDurationFromTrades is the same logic as the former calculateTradesInDuration, on a trades slice (read-only).
+func calculateTradesInDurationFromTrades(trades []exchange.Trade, duration time.Duration) int {
+	if len(trades) == 0 {
 		return 0
 	}
 
 	var mostRecentTime time.Time
 	var oldestTime time.Time
-	for _, trade := range t.Trades {
-		if trade.Order != nil && !trade.Order.Time.IsZero() {
+	for _, tr := range trades {
+		if tr.Order != nil && !tr.Order.Time.IsZero() {
 			if mostRecentTime.IsZero() {
-				mostRecentTime = trade.Order.Time
+				mostRecentTime = tr.Order.Time
 			}
-			oldestTime = trade.Order.Time
+			oldestTime = tr.Order.Time
 		}
 	}
 	if mostRecentTime.IsZero() {
@@ -400,29 +514,26 @@ func (t *trader) calculateTradesInDuration(duration time.Duration) int {
 
 	cutoffTime := mostRecentTime.Add(-duration)
 	count := 0
-	for _, trade := range t.Trades {
-		if trade.Order != nil && !trade.Order.Time.Before(cutoffTime) {
+	for _, tr := range trades {
+		if tr.Order != nil && !tr.Order.Time.Before(cutoffTime) {
 			count++
 		}
 	}
 
-	// If the bounded trade buffer doesn't span the full duration, estimate
-	// per-minute rate from the observed trade span to avoid undercounting.
-	if len(t.Trades) == cap(t.Trades) && !oldestTime.IsZero() && oldestTime.After(cutoffTime) {
+	if len(trades) >= ARRAY_SIZE && !oldestTime.IsZero() && oldestTime.After(cutoffTime) {
 		spanSeconds := mostRecentTime.Sub(oldestTime).Seconds()
 		if spanSeconds > 0 {
-			return int(math.Round(float64(len(t.Trades)) * duration.Seconds() / spanSeconds))
+			return int(math.Round(float64(len(trades)) * duration.Seconds() / spanSeconds))
 		}
 	}
 
 	return count
 }
 
-// calculateSlippage records % distance from best ask (buys) or best bid (sells) to the worst fill (always non-negative).
-// The caller must hold t.Lock.
-func (t *trader) calculateSlippage(trade *exchange.Trade) {
+// calculateTradeSlippagePct returns one slippage sample % vs best bid/ask snapshot. Pure.
+func calculateTradeSlippagePct(trade *exchange.Trade, bestBid, bestAsk float64) (float64, bool) {
 	if trade == nil || len(trade.Fills) == 0 {
-		return
+		return 0, false
 	}
 
 	side := ""
@@ -457,32 +568,27 @@ func (t *trader) calculateSlippage(trade *exchange.Trade) {
 	}
 
 	if (side != "buy" && side != "sell") || worst <= 0 {
-		return
+		return 0, false
 	}
 
 	var ref float64
 	if side == "sell" {
-		ref = t.bestBid
+		ref = bestBid
 	} else if side == "buy" {
-		ref = t.bestAsk
+		ref = bestAsk
 	}
 	if ref <= 0 {
-		return
+		return 0, false
 	}
 
-	slippagePct := math.Abs((worst-ref)/ref) * 100
-	insertWithLimitInPlace(&t.slippagePct, slippagePct, ARRAY_SIZE)
-	t.updateSlippageAvg()
+	return math.Abs((worst-ref)/ref) * 100, true
 }
 
-// updateSlippageAvg sets slippageAvg from slippagePct: arithmetic mean when SLIPPAGE_WEIGHT_FACTOR
-// is 0 or >= 1; otherwise geometric weights with that factor (see model.SLIPPAGE_WEIGHT_FACTOR).
-// The caller must hold t.Lock.
-func (t *trader) updateSlippageAvg() {
-	n := len(t.slippagePct)
+// slippageAvgFromSlice matches updateSlippageAvg logic on a copy of slippagePct. Pure.
+func slippageAvgFromSlice(samples []float64) float64 {
+	n := len(samples)
 	if n == 0 {
-		t.slippageAvg = 0
-		return
+		return 0
 	}
 	if n > ARRAY_SIZE {
 		n = ARRAY_SIZE
@@ -492,24 +598,22 @@ func (t *trader) updateSlippageAvg() {
 	if f <= 0 || f >= 1 {
 		var sum float64
 		for i := 0; i < n; i++ {
-			sum += t.slippagePct[i]
+			sum += samples[i]
 		}
-		t.slippageAvg = sum / float64(n)
-		return
+		return sum / float64(n)
 	}
 
 	var weightedSum float64
 	var totalWeight float64
 	for i := 0; i < n; i++ {
 		weight := math.Pow(f, float64(n-i-1))
-		weightedSum += t.slippagePct[i] * weight
+		weightedSum += samples[i] * weight
 		totalWeight += weight
 	}
 	if totalWeight <= 0 {
-		t.slippageAvg = 0
-		return
+		return 0
 	}
-	t.slippageAvg = weightedSum / totalWeight
+	return weightedSum / totalWeight
 }
 
 func (t *trader) updateBar(bar *exchange.Bar) {
@@ -607,5 +711,20 @@ func spreadRegime(spreadPct float64) string {
 		return "normal"
 	default:
 		return "low"
+	}
+}
+
+func smaSlopeRegime(slopePct float64) string {
+	switch {
+	case math.Abs(slopePct) <= SMA_SLOPE_FLAT_PCT:
+		return "flat"
+	case slopePct > SMA_SLOPE_STRONG_PCT:
+		return "up_strong"
+	case slopePct > SMA_SLOPE_FLAT_PCT:
+		return "up_normal"
+	case slopePct < -SMA_SLOPE_STRONG_PCT:
+		return "down_strong"
+	default:
+		return "down_normal"
 	}
 }
