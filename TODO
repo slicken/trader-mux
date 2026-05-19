@@ -1,0 +1,3 @@
+- rename velo to top velo 
+- add velo for whole orderbook range.. it should not update using ms like top velo
+- add velo for near orderbook range.. it should not update using ms like top velo

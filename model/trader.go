@@ -111,88 +111,211 @@ func volatilityRegime(volatilityPct float64) string {
 }
 
 func (t *trader) updateVolumes(orderbook *exchange.Orderbook) {
-
-	var curBidP, curBidSz, curAskP, curAskSz float64
-	topOK := orderbook != nil && len(orderbook.Bids) > 0 && len(orderbook.Asks) > 0
-	if topOK {
-		curBidP = orderbook.Bids[0].Price
-		curBidSz = orderbook.Bids[0].Size
-		curAskP = orderbook.Asks[0].Price
-		curAskSz = orderbook.Asks[0].Size
+	tickSize := 0.0
+	if t.parent != nil && t.parent.Exchange != nil {
+		if pair, err := t.parent.Exchange.Pair(t.Pair); err == nil {
+			tickSize = pair.Base.TickSize
+		}
 	}
 
 	t.Lock()
 	defer t.Unlock()
 
-	bidsVol, asksVol, volumeImbalancePct, bidNearNotional, askNearNotional, vpoc, vpRat := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL)
-	now := time.Now()
+	ob := t.calculateOrderbook(orderbook, ORDERBOOK_LEVEL, tickSize)
 
-	prev := &t.volumeVelocityProfile
-	newVel := t.volumeVelocity
-	if topOK && prev.valid {
-		if now.Sub(prev.at) >= time.Duration(ORDERBOOK_VELOCITY_MIN_GAP_MS)*time.Millisecond {
-			tickSize := 0.0
-			if t.parent != nil && t.parent.Exchange != nil {
-				if pair, err := t.parent.Exchange.Pair(t.Pair); err == nil {
-					tickSize = pair.Base.TickSize
-				}
-			}
-			raw := topOfBookOFI(curBidP, curBidSz, curAskP, curAskSz, prev.bidPrice, prev.bidSize, prev.askPrice, prev.askSize, tickSize)
-			newVel = EMA(raw, t.volumeVelocity, ORDERBOOK_VELOCITY_EMA_ALPHA)
-			prev.bidPrice, prev.bidSize = curBidP, curBidSz
-			prev.askPrice, prev.askSize = curAskP, curAskSz
-			prev.at = now
-		}
-	} else if topOK {
-		prev.bidPrice, prev.bidSize = curBidP, curBidSz
-		prev.askPrice, prev.askSize = curAskP, curAskSz
-		prev.at = now
-		prev.valid = true
-	} else {
-		prev.valid = false
-	}
-
-	t.nearBidsVolumeAvg = EMA(bidNearNotional, t.nearBidsVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
-	t.nearAsksVolumeAvg = EMA(askNearNotional, t.nearAsksVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
-	// strenght calculation uses combined avg of bid and ask volumes as baseline
+	t.nearBidsVolumeAvg = EMA(ob.bidNear, t.nearBidsVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
+	t.nearAsksVolumeAvg = EMA(ob.askNear, t.nearAsksVolumeAvg, ORDERBOOK_NEAR_EMA_ALPHA)
 	base := (t.nearBidsVolumeAvg + t.nearAsksVolumeAvg) / 2
 	if base <= 0 {
 		t.nearBidsVolumeStr = 0
 		t.nearAsksVolumeStr = 0
 	} else {
-		t.nearBidsVolumeStr = (bidNearNotional / base) * 100
-		t.nearAsksVolumeStr = (askNearNotional / base) * 100
+		t.nearBidsVolumeStr = (ob.bidNear / base) * 100
+		t.nearAsksVolumeStr = (ob.askNear / base) * 100
 	}
 
-	t.bidsVol = bidsVol
-	t.asksVol = asksVol
-	t.volumeImbalancePct = volumeImbalancePct
-	t.vpoc = vpoc
-	t.vpocRatio = vpRat
-	t.volumeVelocity = newVel
+	t.bidsVol = ob.bidsVol
+	t.asksVol = ob.asksVol
+	t.volumeImbalancePct = ob.volumeImbalancePct
+	t.vpoc = ob.vpoc
+	t.vpocRatio = ob.vpocRatio
+	t.topVolumeVelocity = ob.topVolumeVelocity
+	t.bidsDeltaVelocity = EMA(ob.bidDelta, t.bidsDeltaVelocity, ORDERBOOK_DELTA_VELOCITY_EMA_ALPHA)
+	t.asksDeltaVelocity = EMA(ob.askDelta, t.asksDeltaVelocity, ORDERBOOK_DELTA_VELOCITY_EMA_ALPHA)
+	t.nearBidsDeltaVelocity = EMA(ob.bidNearDelta, t.nearBidsDeltaVelocity, ORDERBOOK_DELTA_VELOCITY_EMA_ALPHA)
+	t.nearAsksDeltaVelocity = EMA(ob.askNearDelta, t.nearAsksDeltaVelocity, ORDERBOOK_DELTA_VELOCITY_EMA_ALPHA)
 }
 
-func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol, asksVol, volumeImbalancePct, bidNear, askNear, vpoc, vpRat float64) {
-	if ob == nil || levels <= 0 || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
-		return
-	}
+// orderbookMetrics holds everything derived from one depth-filtered pass over the book.
+type orderbookMetrics struct {
+	bidsVol, asksVol     float64
+	volumeImbalancePct   float64
+	bidNear, askNear     float64
+	vpoc, vpocRatio      float64
+	bidDelta, askDelta         float64 // ORDERBOOK_DEPTH_PCT range: net submission − cancellation $/s
+	bidNearDelta, askNearDelta float64 // ORDERBOOK_NEAR_DEPTH_PCT range
+	topVolumeVelocity             float64
+}
 
-	mid := (ob.Bids[0].Price + ob.Asks[0].Price) / 2
-	if mid <= 0 {
-		return
-	}
+// OrderbookLevelsProfile stores prior book snapshots for velocity metrics.
+type OrderbookLevelsProfile struct {
+	bidSizes        map[float64]float64
+	askSizes        map[float64]float64
+	scratchBids     map[float64]float64
+	scratchAsks     map[float64]float64
+	nearBidSizes    map[float64]float64
+	nearAskSizes    map[float64]float64
+	nearScratchBids map[float64]float64
+	nearScratchAsks map[float64]float64
+	ready           bool
+	topBidP     float64
+	topBidSz    float64
+	topAskP     float64
+	topAskSz    float64
+	topAt       time.Time
+	bookAt      time.Time
+}
 
-	// Tick size is only needed to derive BucketSize once; avoid Exchange.Pair on every snapshot.
-	if t.vpocProfile.BucketSize <= 0 {
-		tickSize := 0.0
-		if t.parent != nil && t.parent.Exchange != nil {
-			if pair, err := t.parent.Exchange.Pair(t.Pair); err == nil {
-				tickSize = pair.Base.TickSize
+func normalizedBookPrice(price, tickSize float64) float64 {
+	if tickSize > 0 {
+		return math.Round(price/tickSize) * tickSize
+	}
+	return price
+}
+
+// diffLevelSubmissionCancel attributes size increases to new limit submissions and size
+// decreases to cancellations after subtracting taker fill volume at each price level.
+func diffLevelSubmissionCancel(cur, prev, filled map[float64]float64) (submission, cancellation float64) {
+	for price, curSz := range cur {
+		prevSz := prev[price]
+		if curSz > prevSz {
+			submission += price * (curSz - prevSz)
+			continue
+		}
+		if curSz < prevSz {
+			cancelSz := prevSz - curSz - filled[price]
+			if cancelSz > 0 {
+				cancellation += price * cancelSz
 			}
 		}
-		if tickSize > 0 {
-			t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
+	}
+	for price, prevSz := range prev {
+		if _, ok := cur[price]; ok {
+			continue
 		}
+		cancelSz := prevSz - filled[price]
+		if cancelSz > 0 {
+			cancellation += price * cancelSz
+		}
+	}
+	return submission, cancellation
+}
+
+func bookDeltaPerSec(cur, prev, filled map[float64]float64, dtSec float64) float64 {
+	if dtSec <= 0 {
+		return 0
+	}
+	sub, can := diffLevelSubmissionCancel(cur, prev, filled)
+	return (sub - can) / dtSec
+}
+
+func tradeFillSizeByPrice(trades []exchange.Trade, since time.Time, takerSide string, tickSize float64) map[float64]float64 {
+	out := make(map[float64]float64)
+	if since.IsZero() {
+		return out
+	}
+	takerSide = strings.ToLower(takerSide)
+	for i := range trades {
+		tr := &trades[i]
+		for _, f := range tr.Fills {
+			if f == nil || f.Size <= 0 || f.Price <= 0 || !f.Time.After(since) {
+				continue
+			}
+			side := strings.ToLower(f.Side)
+			if side != "buy" && side != "sell" && tr.Order != nil {
+				side = strings.ToLower(tr.Order.Side)
+			}
+			if side != takerSide {
+				continue
+			}
+			pk := normalizedBookPrice(f.Price, tickSize)
+			out[pk] += f.Size
+		}
+	}
+	return out
+}
+
+// tradeFillSizeByPriceNear keeps fills at prices inside the near-book band (best bid/ask ± ORDERBOOK_NEAR_DEPTH_PCT).
+func tradeFillSizeByPriceNear(trades []exchange.Trade, since time.Time, takerSide string, tickSize, nearBound float64, isBid bool) map[float64]float64 {
+	out := make(map[float64]float64)
+	if since.IsZero() {
+		return out
+	}
+	takerSide = strings.ToLower(takerSide)
+	for i := range trades {
+		tr := &trades[i]
+		for _, f := range tr.Fills {
+			if f == nil || f.Size <= 0 || f.Price <= 0 || !f.Time.After(since) {
+				continue
+			}
+			if isBid && f.Price < nearBound {
+				continue
+			}
+			if !isBid && f.Price > nearBound {
+				continue
+			}
+			side := strings.ToLower(f.Side)
+			if side != "buy" && side != "sell" && tr.Order != nil {
+				side = strings.ToLower(tr.Order.Side)
+			}
+			if side != takerSide {
+				continue
+			}
+			pk := normalizedBookPrice(f.Price, tickSize)
+			out[pk] += f.Size
+		}
+	}
+	return out
+}
+
+func copyLevelMap(dst, src map[float64]float64) {
+	if dst == nil {
+		return
+	}
+	clear(dst)
+	for price, size := range src {
+		dst[price] = size
+	}
+}
+
+// calculateOrderbook walks bids and asks once inside ORDERBOOK_DEPTH_PCT and returns all book metrics.
+// Caller must hold t.Lock. tickSize comes from Exchange.Pair (lookup once per updateVolumes).
+func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int, tickSize float64) orderbookMetrics {
+	var r orderbookMetrics
+	r.topVolumeVelocity = t.topVolumeVelocity
+
+	prof := &t.orderbookLevelsProfile
+	curBidP, curBidSz := ob.Bids[0].Price, ob.Bids[0].Size
+	curAskP, curAskSz := ob.Asks[0].Price, ob.Asks[0].Size
+	mid := (curBidP + curAskP) / 2
+
+	now := time.Now()
+	if prof.ready {
+		if now.Sub(prof.topAt) >= time.Duration(ORDERBOOK_VELOCITY_MIN_GAP_MS)*time.Millisecond {
+			raw := topOfBookOFI(curBidP, curBidSz, curAskP, curAskSz, prof.topBidP, prof.topBidSz, prof.topAskP, prof.topAskSz, tickSize)
+			r.topVolumeVelocity = EMA(raw, t.topVolumeVelocity, ORDERBOOK_VELOCITY_EMA_ALPHA)
+			prof.topBidP, prof.topBidSz = curBidP, curBidSz
+			prof.topAskP, prof.topAskSz = curAskP, curAskSz
+			prof.topAt = now
+		}
+	} else {
+		prof.topBidP, prof.topBidSz = curBidP, curBidSz
+		prof.topAskP, prof.topAskSz = curAskP, curAskSz
+		prof.topAt = now
+	}
+
+	if t.vpocProfile.BucketSize <= 0 && tickSize > 0 {
+		t.vpocProfile.BucketSize = math.Max(mid*(ORDERBOOK_VPOC_BUCKET_PCT/100), tickSize)
 	}
 	t.vpocProfile.DecayFactor = ORDERBOOK_VPOC_DECAY_FACTOR
 
@@ -216,47 +339,53 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol
 		}
 	}
 
+	clear(prof.scratchBids)
+	clear(prof.scratchAsks)
+	clear(prof.nearScratchBids)
+	clear(prof.nearScratchAsks)
+
 	maxDistance := mid * (ORDERBOOK_DEPTH_PCT / 100)
 	bidNearMinPrice := ob.Bids[0].Price * (1 - (ORDERBOOK_NEAR_DEPTH_PCT / 100))
 	askNearMaxPrice := ob.Asks[0].Price * (1 + (ORDERBOOK_NEAR_DEPTH_PCT / 100))
 	var weightedBidNotional, weightedAskNotional float64
-	var actualBidNotional, actualAskNotional float64
-	var bidNearNotional, askNearNotional float64
 
-	process := func(bookLevels []exchange.Price, isBid bool) {
+	processSide := func(bookLevels []exchange.Price, isBid bool, scratch, nearScratch map[float64]float64) {
 		for i := 0; i < levels && i < len(bookLevels); i++ {
 			level := bookLevels[i]
 			dist := math.Abs(level.Price - mid)
 
 			if level.Price <= 0 || level.Size <= 0 || dist > maxDistance {
-				if isBid && level.Price < (mid-maxDistance) {
+				if isBid && level.Price < mid-maxDistance {
 					break
 				}
-				if !isBid && level.Price > (mid+maxDistance) {
+				if !isBid && level.Price > mid+maxDistance {
 					break
 				}
 				continue
 			}
 
+			notional := level.Price * level.Size
+			pk := normalizedBookPrice(level.Price, tickSize)
+			scratch[pk] += level.Size
+
 			weight := 1.0
 			if ORDERBOOK_WEIGHT_FACTOR > 0 {
 				weight = 1.0 / (1.0 + (dist/mid)*ORDERBOOK_WEIGHT_FACTOR*100)
 			}
-
-			// 3. Consistent Notional Imbalance
-			notional := level.Price * level.Size
 			weightedNotional := notional * weight
 			if isBid {
 				weightedBidNotional += weightedNotional
-				actualBidNotional += notional
+				r.bidsVol += notional
 				if level.Price >= bidNearMinPrice {
-					bidNearNotional += notional
+					r.bidNear += notional
+					nearScratch[pk] += level.Size
 				}
 			} else {
 				weightedAskNotional += weightedNotional
-				actualAskNotional += notional
+				r.asksVol += notional
 				if level.Price <= askNearMaxPrice {
-					askNearNotional += notional
+					r.askNear += notional
+					nearScratch[pk] += level.Size
 				}
 			}
 
@@ -270,20 +399,36 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol
 		}
 	}
 
-	process(ob.Bids, true)
-	process(ob.Asks, false)
+	processSide(ob.Bids, true, prof.scratchBids, prof.nearScratchBids)
+	processSide(ob.Asks, false, prof.scratchAsks, prof.nearScratchAsks)
 
 	totalWeightedNotional := weightedBidNotional + weightedAskNotional
-	volumeImbalancePct = 0.0
 	if totalWeightedNotional > 0 {
-		volumeImbalancePct = ((weightedBidNotional - weightedAskNotional) / totalWeightedNotional) * 100.0
+		r.volumeImbalancePct = ((weightedBidNotional - weightedAskNotional) / totalWeightedNotional) * 100.0
 	}
+
+	if prof.ready {
+		dt := now.Sub(prof.bookAt).Seconds()
+		bidFills := tradeFillSizeByPrice(t.Trades, prof.bookAt, "sell", tickSize)
+		askFills := tradeFillSizeByPrice(t.Trades, prof.bookAt, "buy", tickSize)
+		nearBidFills := tradeFillSizeByPriceNear(t.Trades, prof.bookAt, "sell", tickSize, bidNearMinPrice, true)
+		nearAskFills := tradeFillSizeByPriceNear(t.Trades, prof.bookAt, "buy", tickSize, askNearMaxPrice, false)
+		r.bidDelta = bookDeltaPerSec(prof.scratchBids, prof.bidSizes, bidFills, dt)
+		r.askDelta = bookDeltaPerSec(prof.scratchAsks, prof.askSizes, askFills, dt)
+		r.bidNearDelta = bookDeltaPerSec(prof.nearScratchBids, prof.nearBidSizes, nearBidFills, dt)
+		r.askNearDelta = bookDeltaPerSec(prof.nearScratchAsks, prof.nearAskSizes, nearAskFills, dt)
+	}
+	copyLevelMap(prof.bidSizes, prof.scratchBids)
+	copyLevelMap(prof.askSizes, prof.scratchAsks)
+	copyLevelMap(prof.nearBidSizes, prof.nearScratchBids)
+	copyLevelMap(prof.nearAskSizes, prof.nearScratchAsks)
+	prof.ready = true
+	prof.bookAt = now
 
 	if !vpocEnabled {
-		return actualBidNotional, actualAskNotional, volumeImbalancePct, bidNearNotional, askNearNotional, 0, 0
+		return r
 	}
 
-	// VPOC is the highest-volume price level inside the single highest-volume bucket.
 	var bestIdx int64
 	var maxBucketVolume float64
 	for idx, volume := range vpocBuckets {
@@ -295,18 +440,16 @@ func (t *trader) calculateOrderbook(ob *exchange.Orderbook, levels int) (bidsVol
 			bestIdx = idx
 		}
 	}
-
 	if maxBucketVolume <= 0 {
-		return actualBidNotional, actualAskNotional, volumeImbalancePct, bidNearNotional, askNearNotional, 0, 0
+		return r
 	}
 
-	price := vpocBucketPrice[bestIdx].Price
-	if price <= 0 {
-		price = (float64(bestIdx) * t.vpocProfile.BucketSize) + (t.vpocProfile.BucketSize / 2)
+	r.vpoc = vpocBucketPrice[bestIdx].Price
+	if r.vpoc <= 0 {
+		r.vpoc = (float64(bestIdx) * t.vpocProfile.BucketSize) + (t.vpocProfile.BucketSize / 2)
 	}
-
-	vpRat = vpocBucketRatio(vpocBuckets, bestIdx)
-	return actualBidNotional, actualAskNotional, volumeImbalancePct, bidNearNotional, askNearNotional, price, vpRat
+	r.vpocRatio = vpocBucketRatio(vpocBuckets, bestIdx)
+	return r
 }
 
 // topOfBookOFI is the Cont–Kukanov–Stoikov style increment from prev to cur best bid/ask, in quote notional (price×size, USD for USD-quoted perps).
@@ -337,16 +480,6 @@ func topOfBookOFI(curBidP, curBidSz, curAskP, curAskSz, prevBidP, prevBidSz, pre
 		ofi -= curAskP * curAskSz
 	}
 	return ofi
-}
-
-// VolumeVelocityProfile holds the last accepted top-of-book snapshot for volumeVelocity (OFI).
-type VolumeVelocityProfile struct {
-	bidPrice float64
-	askPrice float64
-	bidSize  float64
-	askSize  float64
-	at       time.Time
-	valid    bool
 }
 
 type VPOCProfile struct {

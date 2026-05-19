@@ -39,7 +39,8 @@ const (
 	ORDERBOOK_WEIGHT_FACTOR = 0.0 // 0 = Disabled. With ORDERBOOK_DEPTH_PCT=0.5, edge liquidity is weighted near 70%.
 
 	ORDERBOOK_VELOCITY_MIN_GAP_MS = 200  // Min ms between OFI samples; wider than tick noise
-	ORDERBOOK_VELOCITY_EMA_ALPHA  = 0.08 // EMA on top-of-book OFI increment (quote notional, e.g. USD)
+	ORDERBOOK_VELOCITY_EMA_ALPHA       = 0.08  // EMA on top-of-book OFI increment (quote notional, e.g. USD)
+	ORDERBOOK_DELTA_VELOCITY_EMA_ALPHA = 0.02  // EMA on bid/ask submission−cancellation delta $/s (slower than top)
 
 	ORDERBOOK_VPOC_BUCKET_PCT    = 0.01 // VPOC bucket width as percent of mid price
 	ORDERBOOK_VPOC_DECAY_FACTOR  = 0.92 // 0 = Disabled. 1 = 100%
@@ -67,45 +68,49 @@ type Marketmaker struct {
 
 // trader is a pair-specific tradingg instance with its own world/settings
 type trader struct {
-	parent                *Marketmaker
-	Pair                  string
-	Bars                  []exchange.Bar
-	Trades                []exchange.Trade
-	Prices                [][2]exchange.Price
-	slippagePct           []float64
-	slippageAvg           float64
-	spreadAvg             float64
-	MarkPrice             float64
-	MidPrice              float64
-	bestBid               float64
-	bestAsk               float64
-	bidsVol               float64
-	asksVol               float64
-	volumeImbalancePct    float64
-	volumeVelocity        float64
-	volumeVelocityProfile VolumeVelocityProfile
-	nearBidsVolumeStr     float64
-	nearBidsVolumeAvg     float64
-	nearAsksVolumeStr     float64
-	nearAsksVolumeAvg     float64
-	vpoc                  float64
-	vpocRatio             float64
-	vpocProfile           VPOCProfile
-	volatilityPct         float64
-	latencyBufferPct      float64
-	tradesPerMinute       int
-	tradesFlowSec         float64
-	tradesImbalancePct    float64
-	tradesDelta           float64
-	tradesDeltaVolume     float64
-	openInterest          float64
-	fundingRate           float64
-	m1_SMA20              float64
-	m1_SMA20Slope         float64
-	m1_SMA20Distance      float64
-	m1_SMA200             float64
-	m1_SMA200Slope        float64
-	m1_SMA200Distance     float64
+	parent                 *Marketmaker
+	Pair                   string
+	Bars                   []exchange.Bar
+	Trades                 []exchange.Trade
+	Prices                 [][2]exchange.Price
+	slippagePct            []float64
+	slippageAvg            float64
+	spreadAvg              float64
+	MarkPrice              float64
+	MidPrice               float64
+	bestBid                float64
+	bestAsk                float64
+	bidsVol                float64
+	asksVol                float64
+	volumeImbalancePct     float64
+	topVolumeVelocity      float64
+	bidsDeltaVelocity      float64
+	asksDeltaVelocity      float64
+	nearBidsDeltaVelocity  float64
+	nearAsksDeltaVelocity  float64
+	orderbookLevelsProfile OrderbookLevelsProfile
+	nearBidsVolumeStr      float64
+	nearBidsVolumeAvg      float64
+	nearAsksVolumeStr      float64
+	nearAsksVolumeAvg      float64
+	vpoc                   float64
+	vpocRatio              float64
+	vpocProfile            VPOCProfile
+	volatilityPct          float64
+	latencyBufferPct       float64
+	tradesPerMinute        int
+	tradesFlowSec          float64
+	tradesImbalancePct     float64
+	tradesDelta            float64
+	tradesDeltaVolume      float64
+	openInterest           float64
+	fundingRate            float64
+	m1_SMA20               float64
+	m1_SMA20Slope          float64
+	m1_SMA20Distance       float64
+	m1_SMA200              float64
+	m1_SMA200Slope         float64
+	m1_SMA200Distance      float64
 	// Trailguard is Pure Guard session state (dynamic stop); optional book-mode resting stop id.
 	Trailguard TrailguardData
 	sync.RWMutex
@@ -235,6 +240,16 @@ func Newtrader(parent *Marketmaker, pair string) *trader {
 		m1_SMA200:          0,
 		m1_SMA200Slope:     0,
 		m1_SMA200Distance:  0,
+		orderbookLevelsProfile: OrderbookLevelsProfile{
+			bidSizes:        make(map[float64]float64, ORDERBOOK_LEVEL),
+			askSizes:        make(map[float64]float64, ORDERBOOK_LEVEL),
+			scratchBids:     make(map[float64]float64, ORDERBOOK_LEVEL),
+			scratchAsks:     make(map[float64]float64, ORDERBOOK_LEVEL),
+			nearBidSizes:    make(map[float64]float64, ORDERBOOK_LEVEL),
+			nearAskSizes:    make(map[float64]float64, ORDERBOOK_LEVEL),
+			nearScratchBids: make(map[float64]float64, ORDERBOOK_LEVEL),
+			nearScratchAsks: make(map[float64]float64, ORDERBOOK_LEVEL),
+		},
 	}
 }
 
